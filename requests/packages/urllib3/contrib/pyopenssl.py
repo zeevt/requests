@@ -88,13 +88,16 @@ DEFAULT_SSL_CIPHER_LIST = util.ssl_.DEFAULT_CIPHERS
 
 orig_util_HAS_SNI = util.HAS_SNI
 orig_connection_ssl_wrap_socket = connection.ssl_wrap_socket
+orig_verifiedhttpsconnection_connect = connection.VerifiedHTTPSConnection.connect
 
 
-def inject_into_urllib3():
+def inject_into_urllib3(strong_cipher_suites_first=True):
     'Monkey-patch urllib3 with PyOpenSSL-backed SSL-support.'
 
     connection.ssl_wrap_socket = ssl_wrap_socket
     util.HAS_SNI = HAS_SNI
+    if strong_cipher_suites_first:
+        connection.VerifiedHTTPSConnection.connect = connect_retry_with_downgrade
 
 
 def extract_from_urllib3():
@@ -102,6 +105,7 @@ def extract_from_urllib3():
 
     connection.ssl_wrap_socket = orig_connection_ssl_wrap_socket
     util.HAS_SNI = orig_util_HAS_SNI
+    VerifiedHTTPSConnection.connect = orig_verifiedhttpsconnection_connect
 
 
 ### Note: This is a slightly bug-fixed version of same from ndg-httpsclient.
@@ -251,7 +255,7 @@ def _verify_callback(cnx, x509, err_no, err_depth, return_code):
 
 def ssl_wrap_socket(sock, keyfile=None, certfile=None, cert_reqs=None,
                     ca_certs=None, server_hostname=None,
-                    ssl_version=None):
+                    ssl_version=None, cipher_suites=None):
     ctx = OpenSSL.SSL.Context(_openssl_versions[ssl_version])
     if certfile:
         keyfile = keyfile or certfile  # Match behaviour of the normal python ssl library
@@ -273,7 +277,10 @@ def ssl_wrap_socket(sock, keyfile=None, certfile=None, cert_reqs=None,
     ctx.set_options(OP_NO_COMPRESSION)
 
     # Set list of supported ciphersuites.
-    ctx.set_cipher_list(DEFAULT_SSL_CIPHER_LIST)
+    if cipher_suites is not None:
+        ctx.set_cipher_list(cipher_suites)
+    else:
+        ctx.set_cipher_list(DEFAULT_SSL_CIPHER_LIST)
 
     cnx = OpenSSL.SSL.Connection(ctx, sock)
     cnx.set_tlsext_host_name(server_hostname)
@@ -288,6 +295,99 @@ def ssl_wrap_socket(sock, keyfile=None, certfile=None, cert_reqs=None,
             continue
         except OpenSSL.SSL.Error as e:
             raise ssl.SSLError('bad handshake', e)
+        print "negotiated", cnx.get_cipher_name()
         break
 
     return WrappedSocket(cnx, sock)
+
+cipherlist = (
+    # PFS AEAD (only these are secure)
+    'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256',
+    'ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256',
+    'DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256',
+    # PFS + CBC
+    'ECDHE-ECDSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA:ECDHE-ECDSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA',
+    'ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES128-SHA',
+    'DHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA:DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA',
+    'DHE-RSA-CAMELLIA256-SHA:DHE-RSA-CAMELLIA128-SHA',
+    'ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA',
+    # no PFS
+    'AES256-GCM-SHA384:AES128-GCM-SHA256',
+    'AES256-SHA256:AES256-SHA:AES128-SHA256:AES128-SHA',
+    'CAMELLIA256-SHA:CAMELLIA128-SHA',
+    'DES-CBC3-SHA',
+    # BROKEN RC4
+    'ECDHE-ECDSA-RC4-SHA:ECDHE-RSA-RC4-SHA:RC4-SHA:RC4-MD5',
+)
+import datetime
+from ..util.ssl_ import (
+    resolve_cert_reqs,
+    resolve_ssl_version,
+    assert_fingerprint,
+)
+from ..packages.ssl_match_hostname import match_hostname
+def connect_retry_with_downgrade(self):
+    is_time_off = datetime.date.today() < connection.RECENT_DATE
+    if is_time_off:
+        warnings.warn((
+            'System time is way off (before {0}). This will probably '
+            'lead to SSL verification errors').format(RECENT_DATE),
+            SystemTimeWarning
+        )
+
+    caught_exception = None
+    for cipher in cipherlist:
+        # print "trying", cipher
+        conn = self._new_conn()
+
+        resolved_cert_reqs = resolve_cert_reqs(self.cert_reqs)
+        resolved_ssl_version = resolve_ssl_version(self.ssl_version)
+
+        hostname = self.host
+        if getattr(self, '_tunnel_host', None):
+            # _tunnel_host was added in Python 2.6.3
+            # (See: http://hg.python.org/cpython/rev/0f57b30a152f)
+
+            self.sock = conn
+            # Calls self._set_hostport(), so self.host is
+            # self._tunnel_host below.
+            self._tunnel()
+            # Mark this connection as not reusable
+            self.auto_open = 0
+
+            # Override the host with the one we're requesting data from.
+            hostname = self._tunnel_host
+
+        # Wrap socket using verification with the root certs in
+        # trusted_root_certs
+        try:
+            self.sock = ssl_wrap_socket(conn, self.key_file, self.cert_file,
+                                        cert_reqs=resolved_cert_reqs,
+                                        ca_certs=self.ca_certs,
+                                        server_hostname=hostname,
+                                        ssl_version=resolved_ssl_version,
+                                        cipher_suites=cipher)
+            break
+        except ssl.SSLError as e:
+            caught_exception = e
+    else:
+        raise caught_exception
+
+    if self.assert_fingerprint:
+        assert_fingerprint(self.sock.getpeercert(binary_form=True),
+                           self.assert_fingerprint)
+    elif resolved_cert_reqs != ssl.CERT_NONE \
+            and self.assert_hostname is not False:
+        cert = self.sock.getpeercert()
+        if not cert.get('subjectAltName', ()):
+            warnings.warn((
+                'Certificate has no `subjectAltName`, falling back to check for a `commonName` for now. '
+                'This feature is being removed by major browsers and deprecated by RFC 2818. '
+                '(See https://github.com/shazow/urllib3/issues/497 for details.)'),
+                SecurityWarning
+            )
+        match_hostname(cert, self.assert_hostname or hostname)
+
+    self.is_verified = (resolved_cert_reqs == ssl.CERT_REQUIRED
+                        or self.assert_fingerprint is not None)
+
