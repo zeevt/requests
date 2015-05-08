@@ -89,7 +89,26 @@ DEFAULT_SSL_CIPHER_LIST = util.ssl_.DEFAULT_CIPHERS
 orig_util_HAS_SNI = util.HAS_SNI
 orig_connection_ssl_wrap_socket = connection.ssl_wrap_socket
 orig_verifiedhttpsconnection_connect = connection.VerifiedHTTPSConnection.connect
-
+cipherlist = (
+    # PFS AEAD (only these are secure)
+    'EECDH+ECDSA+AESGCM',
+    'EECDH+aRSA+AESGCM',
+    'ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305',
+    'EDH+aRSA+AESGCM',
+    # PFS + CBC
+    'EECDH+ECDSA+AES',
+    'EECDH+aRSA+AES',
+    'EDH+aRSA+AES',
+    'EDH+aRSA+CAMELLIA',
+    'ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:EDH-RSA-DES-CBC3-SHA',
+    # no PFS
+    'RSA+AESGCM',
+    'RSA+AES',
+    'RSA+CAMELLIA',
+    'DES-CBC3-SHA',
+    # BROKEN RC4
+    'ECDHE-ECDSA-RC4-SHA:ECDHE-RSA-RC4-SHA:RC4-SHA:RC4-MD5',
+)
 
 def inject_into_urllib3(strong_cipher_suites_first=True):
     'Monkey-patch urllib3 with PyOpenSSL-backed SSL-support.'
@@ -97,7 +116,19 @@ def inject_into_urllib3(strong_cipher_suites_first=True):
     connection.ssl_wrap_socket = ssl_wrap_socket
     util.HAS_SNI = HAS_SNI
     if strong_cipher_suites_first:
-        connection.VerifiedHTTPSConnection.connect = connect_retry_with_downgrade
+        available_ciphers = []
+        global cipherlist
+        for cipher_suites in cipherlist:
+            ctx = OpenSSL.SSL.Context(OpenSSL.SSL.SSLv23_METHOD)
+            try:
+                ctx.set_cipher_list(cipher_suites)
+            except Exception:
+                pass
+            else:
+                available_ciphers.append(cipher_suites)
+        if available_ciphers:
+            cipherlist = available_ciphers
+            connection.VerifiedHTTPSConnection.connect = connect_retry_with_downgrade
 
 
 def extract_from_urllib3():
@@ -300,25 +331,7 @@ def ssl_wrap_socket(sock, keyfile=None, certfile=None, cert_reqs=None,
 
     return WrappedSocket(cnx, sock)
 
-cipherlist = (
-    # PFS AEAD (only these are secure)
-    'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256',
-    'ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256',
-    'DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256',
-    # PFS + CBC
-    'ECDHE-ECDSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA:ECDHE-ECDSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA',
-    'ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES128-SHA',
-    'DHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA:DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA',
-    'DHE-RSA-CAMELLIA256-SHA:DHE-RSA-CAMELLIA128-SHA',
-    'ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA',
-    # no PFS
-    'AES256-GCM-SHA384:AES128-GCM-SHA256',
-    'AES256-SHA256:AES256-SHA:AES128-SHA256:AES128-SHA',
-    'CAMELLIA256-SHA:CAMELLIA128-SHA',
-    'DES-CBC3-SHA',
-    # BROKEN RC4
-    'ECDHE-ECDSA-RC4-SHA:ECDHE-RSA-RC4-SHA:RC4-SHA:RC4-MD5',
-)
+
 import datetime
 from ..util.ssl_ import (
     resolve_cert_reqs,
