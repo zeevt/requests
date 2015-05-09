@@ -328,6 +328,8 @@ def ssl_wrap_socket(sock, keyfile=None, certfile=None, cert_reqs=None,
         except OpenSSL.SSL.Error as e:
             raise ssl.SSLError('bad handshake', e)
         print "negotiated", cnx.get_cipher_name()
+        if hasattr(cnx, 'get_pfs_details'):
+            print "pfs details:", cnx.get_pfs_details()
         break
 
     return WrappedSocket(cnx, sock)
